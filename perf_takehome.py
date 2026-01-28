@@ -114,6 +114,12 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Pre-load all hash stage constants before loop entry so that no
+        # load("const") instructions appear inside the loop body.
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.scratch_const(val1)
+            self.scratch_const(val3)
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the

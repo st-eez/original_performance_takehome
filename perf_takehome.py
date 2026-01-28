@@ -399,51 +399,64 @@ class KernelBuilder:
         inner_loop_start = len(self.instrs)
 
         # --- Inner loop body: process 8 elements per iteration ---
+        # Emissions are ordered so independent ops from different groups are
+        # adjacent, letting the VLIW packer fill otherwise-empty slots.
 
-        # Compute base addresses for this group of 8
+        # Compute base addresses for this group of 8 (2 alu ops pack together)
         self.add("alu", ("+", batch_base_idx, self.scratch["inp_indices_p"], batch_counter))
         self.add("alu", ("+", batch_base_val, self.scratch["inp_values_p"], batch_counter))
 
-        # Vector load 8 indices and 8 values
+        # Vector load 8 indices and 8 values (2 loads pack, broadcast fills valu slot)
         self.add("load", ("vload", v_idx, batch_base_idx))
         self.add("load", ("vload", v_val, batch_base_val))
-
-        # Gather tree node values: v_addr[i] = forest_values_p + idx[i]
         self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
-        self.add("valu", ("+", v_addr, v_addr, v_idx))
 
-        # 8 load_offset instructions for gather (2 per cycle due to load slot limit)
-        for offset in range(VLEN):
-            self.add("load", ("load_offset", v_node_val, v_addr, offset))
+        # Gather address + early idx multiply (WAR on v_idx is not a conflict,
+        # so v_addr+=v_idx and v_idx*=2 pack into one bundle)
+        self.add("valu", ("+", v_addr, v_addr, v_idx))
+        self.add("valu", ("*", v_idx, v_idx, v_two))
+
+        # Gather loads interleaved with independent loop-control ops that
+        # would otherwise need their own bundles after the stores.
+        # Pair 1 of gathers
+        self.add("load", ("load_offset", v_node_val, v_addr, 0))
+        self.add("load", ("load_offset", v_node_val, v_addr, 1))
+        # Increment loop counter early (independent of body computations)
+        self.add("flow", ("add_imm", batch_counter, batch_counter, VLEN))
+        # Pair 2 of gathers
+        self.add("load", ("load_offset", v_node_val, v_addr, 2))
+        self.add("load", ("load_offset", v_node_val, v_addr, 3))
+        # Loop compare (reads updated batch_counter from previous bundle)
+        self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
+        # Pair 3 of gathers
+        self.add("load", ("load_offset", v_node_val, v_addr, 4))
+        self.add("load", ("load_offset", v_node_val, v_addr, 5))
+        # Pair 4 of gathers
+        self.add("load", ("load_offset", v_node_val, v_addr, 6))
+        self.add("load", ("load_offset", v_node_val, v_addr, 7))
 
         # XOR val with node_val
         self.add("valu", ("^", v_val, v_val, v_node_val))
 
-        # --- Vector hash function ---
+        # --- Vector hash function (tmp1/tmp2 ops adjacent → pack per stage) ---
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
             self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
             self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
 
-        # --- Index computation ---
+        # --- Index computation (multiply already done above) ---
         # idx = 2*idx + (1 if val % 2 == 0 else 2)
         self.add("valu", ("%", v_tmp1, v_val, v_two))
         self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
-        # vselect uses flow engine (limit 1 per cycle), so separate calls
         self.add("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two))
-        self.add("valu", ("*", v_idx, v_idx, v_two))
         self.add("valu", ("+", v_idx, v_idx, v_tmp2))
         # idx = 0 if idx >= n_nodes else idx
         self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
         self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
 
-        # Vector store results back to memory
+        # Stores + loop branch (compare result in tmp1 computed during gathers)
         self.add("store", ("vstore", batch_base_idx, v_idx))
         self.add("store", ("vstore", batch_base_val, v_val))
-
-        # Inner loop control: increment batch_counter by VLEN, compare, jump back
-        self.add("flow", ("add_imm", batch_counter, batch_counter, VLEN))
-        self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
         self.add("flow", ("cond_jump", tmp1, inner_loop_start))
 
         # Outer loop control: increment round counter, compare, jump back

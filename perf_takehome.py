@@ -334,6 +334,9 @@ class KernelBuilder:
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             self.scratch_const(val1)
             self.scratch_const(val3)
+            # Pre-load multiply_add multiplier constants for collapsible stages
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                self.scratch_const(1 + (1 << val3))
 
         # --- Vector scratch regions (8 words each) ---
         v_idx = self.alloc_scratch("v_idx", VLEN)
@@ -366,6 +369,13 @@ class KernelBuilder:
                 v_c = self.alloc_scratch(f"v_hash_{val3}", VLEN)
                 self.add("valu", ("vbroadcast", v_c, self.scratch_const(val3)))
                 v_hash_consts[val3] = v_c
+            # Broadcast multiply_add multiplier constants for collapsible stages
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mult = 1 + (1 << val3)
+                if mult not in v_hash_consts:
+                    v_c = self.alloc_scratch(f"v_hash_{mult}", VLEN)
+                    self.add("valu", ("vbroadcast", v_c, self.scratch_const(mult)))
+                    v_hash_consts[mult] = v_c
 
         # Scalar scratch for batch base addresses
         batch_base_idx = self.alloc_scratch("batch_base_idx")
@@ -438,11 +448,16 @@ class KernelBuilder:
         # XOR val with node_val
         self.add("valu", ("^", v_val, v_val, v_node_val))
 
-        # --- Vector hash function (tmp1/tmp2 ops adjacent → pack per stage) ---
+        # --- Vector hash function (multiply_add collapses 3 stages) ---
         for op1, val1, op2, op3, val3 in HASH_STAGES:
-            self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
-            self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
-            self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Collapsible: val = val * (1 + 2^shift) + addend
+                mult = 1 + (1 << val3)
+                self.add("valu", ("multiply_add", v_val, v_val, v_hash_consts[mult], v_hash_consts[val1]))
+            else:
+                self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
+                self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
+                self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
 
         # --- Index computation (multiply already done above) ---
         # idx = 2*idx + (1 if val % 2 == 0 else 2)

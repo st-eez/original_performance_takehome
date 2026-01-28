@@ -377,9 +377,14 @@ class KernelBuilder:
                     self.add("valu", ("vbroadcast", v_c, self.scratch_const(mult)))
                     v_hash_consts[mult] = v_c
 
-        # Scalar scratch for batch base addresses
+        # Scalar scratch for batch base addresses (current and next for pipelining)
         batch_base_idx = self.alloc_scratch("batch_base_idx")
         batch_base_val = self.alloc_scratch("batch_base_val")
+        next_base_idx = self.alloc_scratch("next_base_idx")
+        next_base_val = self.alloc_scratch("next_base_val")
+
+        # Extra vector scratch for pipelined next-iteration indices
+        v_next_idx = self.alloc_scratch("v_next_idx", VLEN)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps.
@@ -405,53 +410,41 @@ class KernelBuilder:
         # Initialize batch counter at the start of each outer iteration
         self.add("load", ("const", batch_counter, 0))
 
-        # Record the PC of the inner loop start
-        inner_loop_start = len(self.instrs)
-
-        # --- Inner loop body: process 8 elements per iteration ---
-        # Emissions are ordered so independent ops from different groups are
-        # adjacent, letting the VLIW packer fill otherwise-empty slots.
-
-        # Compute base addresses for this group of 8 (2 alu ops pack together)
+        # ===== PROLOGUE: load and gather first batch =====
+        # Compute base addresses for batch 0
         self.add("alu", ("+", batch_base_idx, self.scratch["inp_indices_p"], batch_counter))
         self.add("alu", ("+", batch_base_val, self.scratch["inp_values_p"], batch_counter))
 
-        # Vector load 8 indices and 8 values (2 loads pack, broadcast fills valu slot)
+        # Vector load batch 0 indices and values
         self.add("load", ("vload", v_idx, batch_base_idx))
         self.add("load", ("vload", v_val, batch_base_val))
         self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
 
-        # Gather address + early idx multiply (WAR on v_idx is not a conflict,
-        # so v_addr+=v_idx and v_idx*=2 pack into one bundle)
+        # Gather address computation + early idx multiply
         self.add("valu", ("+", v_addr, v_addr, v_idx))
         self.add("valu", ("*", v_idx, v_idx, v_two))
 
-        # Gather loads interleaved with independent loop-control ops that
-        # would otherwise need their own bundles after the stores.
-        # Pair 1 of gathers
-        self.add("load", ("load_offset", v_node_val, v_addr, 0))
-        self.add("load", ("load_offset", v_node_val, v_addr, 1))
-        # Increment loop counter early (independent of body computations)
+        # Gather 8 node values for batch 0
+        for gi in range(VLEN):
+            self.add("load", ("load_offset", v_node_val, v_addr, gi))
+
+        # Advance batch counter past the first batch
         self.add("flow", ("add_imm", batch_counter, batch_counter, VLEN))
-        # Pair 2 of gathers
-        self.add("load", ("load_offset", v_node_val, v_addr, 2))
-        self.add("load", ("load_offset", v_node_val, v_addr, 3))
-        # Loop compare (reads updated batch_counter from previous bundle)
+
+        # Check if there are more batches; if not, skip to epilogue
         self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
-        # Pair 3 of gathers
-        self.add("load", ("load_offset", v_node_val, v_addr, 4))
-        self.add("load", ("load_offset", v_node_val, v_addr, 5))
-        # Pair 4 of gathers
-        self.add("load", ("load_offset", v_node_val, v_addr, 6))
-        self.add("load", ("load_offset", v_node_val, v_addr, 7))
+        epilogue_jump = len(self.instrs)  # placeholder for conditional jump
+        self.add("flow", ("cond_jump", tmp1, 0))  # target patched below
+
+        # ===== EPILOGUE (jumped to when only 1 batch): hash + index + store =====
+        epilogue_start = len(self.instrs)
 
         # XOR val with node_val
         self.add("valu", ("^", v_val, v_val, v_node_val))
 
-        # --- Vector hash function (multiply_add collapses 3 stages) ---
+        # Hash (non-interleaved, no next batch to gather)
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             if op1 == "+" and op2 == "+" and op3 == "<<":
-                # Collapsible: val = val * (1 + 2^shift) + addend
                 mult = 1 + (1 << val3)
                 self.add("valu", ("multiply_add", v_val, v_val, v_hash_consts[mult], v_hash_consts[val1]))
             else:
@@ -459,20 +452,130 @@ class KernelBuilder:
                 self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
                 self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
 
-        # --- Index computation (multiply already done above) ---
-        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        # Index computation
         self.add("valu", ("%", v_tmp1, v_val, v_two))
         self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
         self.add("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two))
         self.add("valu", ("+", v_idx, v_idx, v_tmp2))
-        # idx = 0 if idx >= n_nodes else idx
         self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
         self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
 
-        # Stores + loop branch (compare result in tmp1 computed during gathers)
+        # Store results
         self.add("store", ("vstore", batch_base_idx, v_idx))
         self.add("store", ("vstore", batch_base_val, v_val))
+
+        # Jump to outer loop control (skip inner loop body)
+        outer_loop_jump = len(self.instrs)  # placeholder
+        self.add("flow", ("jump", 0))  # target patched below
+
+        # ===== Patch: prologue jumps here when there ARE more batches =====
+        # We need to jump PAST the epilogue into the inner loop
+        inner_loop_entry = len(self.instrs)
+        # Patch the prologue's conditional jump: if more batches, skip epilogue
+        # The cond_jump at epilogue_jump should jump to inner_loop_entry when true
+        self.instrs[epilogue_jump] = {"flow": [("cond_jump", tmp1, inner_loop_entry)]}
+
+        # ===== INNER LOOP BODY: hash current + gather next =====
+        inner_loop_start = len(self.instrs)
+
+        # XOR current batch's values with gathered node values
+        self.add("valu", ("^", v_val, v_val, v_node_val))
+
+        # Prepare next batch: compute base addresses (packs with XOR - different engine)
+        self.add("alu", ("+", next_base_idx, self.scratch["inp_indices_p"], batch_counter))
+        self.add("alu", ("+", next_base_val, self.scratch["inp_values_p"], batch_counter))
+
+        # Load next batch indices and values (packs with broadcast - load+valu)
+        self.add("load", ("vload", v_next_idx, next_base_idx))
+        self.add("load", ("vload", v_tmp3, next_base_val))
+        self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
+
+        # Compute next gather addresses + early multiply (pack: WAR on v_next_idx is OK)
+        self.add("valu", ("+", v_addr, v_addr, v_next_idx))
+        self.add("valu", ("*", v_next_idx, v_next_idx, v_two))
+
+        # --- Hash current batch (valu) INTERLEAVED with gather next batch (load) ---
+        # During hash's ~9 valu cycles, load slots are idle. The 8 gather loads
+        # (4 cycles at 2 loads/cycle) pack into hash bundles at zero extra cost.
+        gather_offset = 0
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Collapsible stage: single multiply_add
+                mult = 1 + (1 << val3)
+                self.add("valu", ("multiply_add", v_val, v_val, v_hash_consts[mult], v_hash_consts[val1]))
+                # Inject gather pair (packs with multiply_add: valu + 2 load)
+                if gather_offset < VLEN:
+                    self.add("load", ("load_offset", v_node_val, v_addr, gather_offset))
+                    self.add("load", ("load_offset", v_node_val, v_addr, gather_offset + 1))
+                    gather_offset += 2
+            else:
+                # Non-collapsible: op1+op3 pack together, then op2 alone
+                self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
+                self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
+                # Inject gather pair (packs with op1+op3: 2 valu + 2 load)
+                if gather_offset < VLEN:
+                    self.add("load", ("load_offset", v_node_val, v_addr, gather_offset))
+                    self.add("load", ("load_offset", v_node_val, v_addr, gather_offset + 1))
+                    gather_offset += 2
+                self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
+
+        # --- Index computation for current batch ---
+        self.add("valu", ("%", v_tmp1, v_val, v_two))
+        self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
+        self.add("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two))
+        self.add("valu", ("+", v_idx, v_idx, v_tmp2))
+        self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
+        self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
+
+        # Store current batch results
+        self.add("store", ("vstore", batch_base_idx, v_idx))
+        self.add("store", ("vstore", batch_base_val, v_val))
+
+        # Move next batch data to current registers for the next iteration
+        # Vector copies: v_idx = v_next_idx, v_val = v_tmp3 (add zero = identity)
+        self.add("valu", ("+", v_idx, v_next_idx, v_zero))
+        self.add("valu", ("+", v_val, v_tmp3, v_zero))
+        # Scalar copies: batch_base = next_base
+        self.add("alu", ("+", batch_base_idx, next_base_idx, zero_const))
+        self.add("alu", ("+", batch_base_val, next_base_val, zero_const))
+
+        # Loop control: advance counter, check, branch
+        self.add("flow", ("add_imm", batch_counter, batch_counter, VLEN))
+        self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
         self.add("flow", ("cond_jump", tmp1, inner_loop_start))
+
+        # --- After inner loop exits: epilogue for final batch ---
+        # The last loop iteration gathered the final batch into v_node_val
+        # and copied its data to v_idx/v_val. Process it now.
+
+        # XOR final batch
+        self.add("valu", ("^", v_val, v_val, v_node_val))
+
+        # Hash (non-interleaved)
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mult = 1 + (1 << val3)
+                self.add("valu", ("multiply_add", v_val, v_val, v_hash_consts[mult], v_hash_consts[val1]))
+            else:
+                self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
+                self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
+                self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
+
+        # Index computation
+        self.add("valu", ("%", v_tmp1, v_val, v_two))
+        self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
+        self.add("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two))
+        self.add("valu", ("+", v_idx, v_idx, v_tmp2))
+        self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
+        self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
+
+        # Store final batch
+        self.add("store", ("vstore", batch_base_idx, v_idx))
+        self.add("store", ("vstore", batch_base_val, v_val))
+
+        # Patch the epilogue-only jump target to land here (outer loop control)
+        outer_loop_ctrl = len(self.instrs)
+        self.instrs[outer_loop_jump] = {"flow": [("jump", outer_loop_ctrl)]}
 
         # Outer loop control: increment round counter, compare, jump back
         self.add("flow", ("add_imm", round_counter, round_counter, 1))

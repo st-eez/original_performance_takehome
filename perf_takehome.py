@@ -88,8 +88,8 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized kernel: processes VLEN=8 batch elements per inner loop iteration
+        using vload, valu, vstore, vselect, and load_offset for gather.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -120,19 +120,46 @@ class KernelBuilder:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        # --- Vector scratch regions (8 words each) ---
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_addr = self.alloc_scratch("v_addr", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # --- Vector constant regions (broadcast before loops) ---
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+
+        self.add("valu", ("vbroadcast", v_zero, zero_const))
+        self.add("valu", ("vbroadcast", v_one, one_const))
+        self.add("valu", ("vbroadcast", v_two, two_const))
+        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+
+        # Broadcast all hash constants to vector regions
+        v_hash_consts = {}
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            if val1 not in v_hash_consts:
+                v_c = self.alloc_scratch(f"v_hash_{val1}", VLEN)
+                self.add("valu", ("vbroadcast", v_c, self.scratch_const(val1)))
+                v_hash_consts[val1] = v_c
+            if val3 not in v_hash_consts:
+                v_c = self.alloc_scratch(f"v_hash_{val3}", VLEN)
+                self.add("valu", ("vbroadcast", v_c, self.scratch_const(val3)))
+                v_hash_consts[val3] = v_c
+
+        # Scalar scratch for batch base addresses
+        batch_base_idx = self.alloc_scratch("batch_base_idx")
+        batch_base_val = self.alloc_scratch("batch_base_val")
+
+        # Pause instructions are matched up with yield statements in the reference
+        # kernel to let you debug at intermediate steps.
+        self.add("flow", ("pause",))
+        self.add("debug", ("comment", "Starting vectorized loop"))
 
         # Hardware round loop: allocate counter and rounds constant
         round_counter = self.alloc_scratch("round_counter")
@@ -156,39 +183,51 @@ class KernelBuilder:
         # Record the PC of the inner loop start
         inner_loop_start = len(self.instrs)
 
-        # Inner loop body (emitted once, iterated via hardware loop)
-        # idx = mem[inp_indices_p + batch_counter]
-        self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_counter))
-        self.add("load", ("load", tmp_idx, tmp_addr))
-        # val = mem[inp_values_p + batch_counter]
-        self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_counter))
-        self.add("load", ("load", tmp_val, tmp_addr))
-        # node_val = mem[forest_values_p + idx]
-        self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
-        self.add("load", ("load", tmp_node_val, tmp_addr))
-        # val = myhash(val ^ node_val)
-        self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
-        hash_slots = self.build_hash(tmp_val, tmp1, tmp2)
-        for engine, slot in hash_slots:
-            self.add(engine, slot)
-        # idx = 2*idx + (1 if val % 2 == 0 else 2)
-        self.add("alu", ("%", tmp1, tmp_val, two_const))
-        self.add("alu", ("==", tmp1, tmp1, zero_const))
-        self.add("flow", ("select", tmp3, tmp1, one_const, two_const))
-        self.add("alu", ("*", tmp_idx, tmp_idx, two_const))
-        self.add("alu", ("+", tmp_idx, tmp_idx, tmp3))
-        # idx = 0 if idx >= n_nodes else idx
-        self.add("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
-        self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
-        # mem[inp_indices_p + batch_counter] = idx
-        self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_counter))
-        self.add("store", ("store", tmp_addr, tmp_idx))
-        # mem[inp_values_p + batch_counter] = val
-        self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_counter))
-        self.add("store", ("store", tmp_addr, tmp_val))
+        # --- Inner loop body: process 8 elements per iteration ---
 
-        # Inner loop control: increment batch_counter, compare, jump back
-        self.add("flow", ("add_imm", batch_counter, batch_counter, 1))
+        # Compute base addresses for this group of 8
+        self.add("alu", ("+", batch_base_idx, self.scratch["inp_indices_p"], batch_counter))
+        self.add("alu", ("+", batch_base_val, self.scratch["inp_values_p"], batch_counter))
+
+        # Vector load 8 indices and 8 values
+        self.add("load", ("vload", v_idx, batch_base_idx))
+        self.add("load", ("vload", v_val, batch_base_val))
+
+        # Gather tree node values: v_addr[i] = forest_values_p + idx[i]
+        self.add("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))
+        self.add("valu", ("+", v_addr, v_addr, v_idx))
+
+        # 8 load_offset instructions for gather (2 per cycle due to load slot limit)
+        for offset in range(VLEN):
+            self.add("load", ("load_offset", v_node_val, v_addr, offset))
+
+        # XOR val with node_val
+        self.add("valu", ("^", v_val, v_val, v_node_val))
+
+        # --- Vector hash function ---
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.add("valu", (op1, v_tmp1, v_val, v_hash_consts[val1]))
+            self.add("valu", (op3, v_tmp2, v_val, v_hash_consts[val3]))
+            self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
+
+        # --- Index computation ---
+        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        self.add("valu", ("%", v_tmp1, v_val, v_two))
+        self.add("valu", ("==", v_tmp1, v_tmp1, v_zero))
+        # vselect uses flow engine (limit 1 per cycle), so separate calls
+        self.add("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two))
+        self.add("valu", ("*", v_idx, v_idx, v_two))
+        self.add("valu", ("+", v_idx, v_idx, v_tmp2))
+        # idx = 0 if idx >= n_nodes else idx
+        self.add("valu", ("<", v_tmp1, v_idx, v_n_nodes))
+        self.add("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))
+
+        # Vector store results back to memory
+        self.add("store", ("vstore", batch_base_idx, v_idx))
+        self.add("store", ("vstore", batch_base_val, v_val))
+
+        # Inner loop control: increment batch_counter by VLEN, compare, jump back
+        self.add("flow", ("add_imm", batch_counter, batch_counter, VLEN))
         self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
         self.add("flow", ("cond_jump", tmp1, inner_loop_start))
 

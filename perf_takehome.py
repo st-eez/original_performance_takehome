@@ -74,6 +74,221 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    @staticmethod
+    def get_slot_deps(engine, slot):
+        """Return (reads: set, writes: set) of scratch addresses for a single slot."""
+        reads = set()
+        writes = set()
+
+        if engine == "alu":
+            # (op, dest, a1, a2)
+            op, dest, a1, a2 = slot
+            reads = {a1, a2}
+            writes = {dest}
+
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                # ("vbroadcast", dest, src)
+                _, dest, src = slot
+                reads = {src}
+                writes = set(range(dest, dest + VLEN))
+            elif slot[0] == "multiply_add":
+                # ("multiply_add", dest, a, b, c)
+                _, dest, a, b, c = slot
+                reads = set(range(a, a + VLEN)) | set(range(b, b + VLEN)) | set(range(c, c + VLEN))
+                writes = set(range(dest, dest + VLEN))
+            else:
+                # (op, dest, a1, a2) - vector op
+                op, dest, a1, a2 = slot
+                reads = set(range(a1, a1 + VLEN)) | set(range(a2, a2 + VLEN))
+                writes = set(range(dest, dest + VLEN))
+
+        elif engine == "load":
+            if slot[0] == "load":
+                # ("load", dest, addr)
+                _, dest, addr = slot
+                reads = {addr}
+                writes = {dest}
+            elif slot[0] == "load_offset":
+                # ("load_offset", dest, addr, offset)
+                _, dest, addr, offset = slot
+                reads = {addr + offset}
+                writes = {dest + offset}
+            elif slot[0] == "vload":
+                # ("vload", dest, addr) - addr is scalar
+                _, dest, addr = slot
+                reads = {addr}
+                writes = set(range(dest, dest + VLEN))
+            elif slot[0] == "const":
+                # ("const", dest, val)
+                _, dest, val = slot
+                writes = {dest}
+
+        elif engine == "store":
+            if slot[0] == "store":
+                # ("store", addr, src) - writes to memory, not scratch
+                _, addr, src = slot
+                reads = {addr, src}
+            elif slot[0] == "vstore":
+                # ("vstore", addr, src) - addr is scalar, src is vector
+                _, addr, src = slot
+                reads = {addr} | set(range(src, src + VLEN))
+
+        elif engine == "flow":
+            if slot[0] == "select":
+                # ("select", dest, cond, a, b)
+                _, dest, cond, a, b = slot
+                reads = {cond, a, b}
+                writes = {dest}
+            elif slot[0] == "vselect":
+                # ("vselect", dest, cond, a, b)
+                _, dest, cond, a, b = slot
+                reads = set(range(cond, cond + VLEN)) | set(range(a, a + VLEN)) | set(range(b, b + VLEN))
+                writes = set(range(dest, dest + VLEN))
+            elif slot[0] == "add_imm":
+                # ("add_imm", dest, a, imm)
+                _, dest, a, imm = slot
+                reads = {a}
+                writes = {dest}
+            elif slot[0] == "cond_jump":
+                # ("cond_jump", cond, addr)
+                _, cond, addr = slot
+                reads = {cond}
+            elif slot[0] == "cond_jump_rel":
+                # ("cond_jump_rel", cond, offset)
+                _, cond, offset = slot
+                reads = {cond}
+            elif slot[0] in ("jump", "halt", "pause"):
+                pass  # no scratch deps
+            elif slot[0] == "jump_indirect":
+                _, addr = slot
+                reads = {addr}
+            elif slot[0] == "coreid":
+                _, dest = slot
+                writes = {dest}
+            elif slot[0] == "trace_write":
+                _, val = slot
+                reads = {val}
+
+        elif engine == "debug":
+            pass  # no dependencies
+
+        return reads, writes
+
+    def pack_instructions(self):
+        """
+        Pack consecutive non-conflicting single-slot instruction bundles into
+        multi-slot VLIW bundles, respecting slot limits and data dependencies.
+
+        Conflict rules (scratch addresses only):
+        - RAW: slot reads an address the current bundle writes -> conflict
+        - WAW: slot writes an address the current bundle writes -> conflict
+        - WAR is NOT a conflict because all reads happen at cycle start.
+
+        Jump/branch instructions force a bundle boundary after them.
+        Also remaps jump targets from old instruction indices to new packed indices.
+        """
+        # Phase 0: Collect all jump targets so we force bundle boundaries before them
+        jump_targets = set()
+        for instr in self.instrs:
+            if "flow" in instr:
+                for slot in instr["flow"]:
+                    if slot[0] == "cond_jump":
+                        jump_targets.add(slot[2])
+                    elif slot[0] == "jump":
+                        jump_targets.add(slot[1])
+
+        # Phase 1: Pack instructions, tracking which old indices map to which new indices
+        packed = []
+        # old_to_new[old_idx] = new packed bundle index that contains old_idx's instruction
+        old_to_new = {}
+        current_bundle = {}
+        current_writes = set()
+        current_reads = set()
+        current_slot_counts = defaultdict(int)
+
+        for old_idx, instr in enumerate(self.instrs):
+            # Force a bundle boundary before any jump target
+            if old_idx in jump_targets and current_bundle:
+                packed.append(current_bundle)
+                current_bundle = {}
+                current_writes = set()
+                current_reads = set()
+                current_slot_counts = defaultdict(int)
+            for engine, slots in instr.items():
+                for slot in slots:
+                    reads, writes = self.get_slot_deps(engine, slot)
+
+                    can_pack = True
+
+                    # RAW conflict: slot reads something current bundle writes
+                    if reads & current_writes:
+                        can_pack = False
+
+                    # WAW conflict: slot writes something current bundle writes
+                    if writes & current_writes:
+                        can_pack = False
+
+                    # Slot limit check
+                    if current_slot_counts[engine] >= SLOT_LIMITS.get(engine, 64):
+                        can_pack = False
+
+                    if can_pack:
+                        if engine not in current_bundle:
+                            current_bundle[engine] = []
+                        current_bundle[engine].append(slot)
+                        current_slot_counts[engine] += 1
+                        current_writes |= writes
+                        current_reads |= reads
+                    else:
+                        # Flush current bundle and start a new one
+                        if current_bundle:
+                            packed.append(current_bundle)
+                        current_bundle = {engine: [slot]}
+                        current_writes = set(writes)
+                        current_reads = set(reads)
+                        current_slot_counts = defaultdict(int)
+                        current_slot_counts[engine] = 1
+
+                    # Record mapping: this old instruction is in the current (last) packed bundle
+                    old_to_new[old_idx] = len(packed)  # index of current_bundle when it gets appended
+
+                    # Jump/branch instructions must end the bundle
+                    if engine == "flow" and slot[0] in ("cond_jump", "cond_jump_rel", "jump", "jump_indirect", "halt", "pause"):
+                        if current_bundle:
+                            packed.append(current_bundle)
+                        current_bundle = {}
+                        current_writes = set()
+                        current_reads = set()
+                        current_slot_counts = defaultdict(int)
+
+        if current_bundle:
+            packed.append(current_bundle)
+
+        # Phase 2: Remap jump targets from old indices to new packed indices
+        for bundle in packed:
+            if "flow" in bundle:
+                new_flow_slots = []
+                for slot in bundle["flow"]:
+                    if slot[0] == "cond_jump":
+                        # ("cond_jump", cond, addr) - addr is old PC
+                        cond, old_addr = slot[1], slot[2]
+                        new_addr = old_to_new.get(old_addr, old_addr)
+                        new_flow_slots.append(("cond_jump", cond, new_addr))
+                    elif slot[0] == "jump":
+                        # ("jump", addr)
+                        old_addr = slot[1]
+                        new_addr = old_to_new.get(old_addr, old_addr)
+                        new_flow_slots.append(("jump", new_addr))
+                    elif slot[0] == "jump_indirect":
+                        # Jump target is in scratch, no remapping needed
+                        new_flow_slots.append(slot)
+                    else:
+                        new_flow_slots.append(slot)
+                bundle["flow"] = new_flow_slots
+
+        return packed
+
     def build_hash(self, val_hash_addr, tmp1, tmp2):
         slots = []
 
@@ -238,6 +453,9 @@ class KernelBuilder:
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
+
+        # Pack instructions into VLIW bundles
+        self.instrs = self.pack_instructions()
 
 BASELINE = 147734
 

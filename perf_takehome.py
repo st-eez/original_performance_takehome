@@ -122,8 +122,6 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
-
         # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
         tmp_val = self.alloc_scratch("tmp_val")
@@ -134,46 +132,61 @@ class KernelBuilder:
         round_counter = self.alloc_scratch("round_counter")
         rounds_addr = self.alloc_scratch("rounds_const")
         self.add("load", ("const", rounds_addr, rounds))
+
+        # Hardware inner batch loop: allocate counter and batch_size constant
+        batch_counter = self.alloc_scratch("batch_counter")
+        batch_size_addr = self.alloc_scratch("batch_size_const")
+        self.add("load", ("const", batch_size_addr, batch_size))
+
+        # Initialize round counter before outer loop
         self.add("load", ("const", round_counter, 0))
 
-        # Record the PC of the loop start
+        # Record the PC of the outer loop start
         loop_start = len(self.instrs)
 
-        # Inner batch loop (still fully unrolled)
-        for i in range(batch_size):
-            i_const = self.scratch_const(i)
-            # idx = mem[inp_indices_p + i]
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            body.append(("load", ("load", tmp_idx, tmp_addr)))
-            # val = mem[inp_values_p + i]
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-            body.append(("load", ("load", tmp_val, tmp_addr)))
-            # node_val = mem[forest_values_p + idx]
-            body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-            body.append(("load", ("load", tmp_node_val, tmp_addr)))
-            # val = myhash(val ^ node_val)
-            body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-            body.extend(self.build_hash(tmp_val, tmp1, tmp2))
-            # idx = 2*idx + (1 if val % 2 == 0 else 2)
-            body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-            body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-            body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-            body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-            body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-            # idx = 0 if idx >= n_nodes else idx
-            body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-            body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-            # mem[inp_indices_p + i] = idx
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            body.append(("store", ("store", tmp_addr, tmp_idx)))
-            # mem[inp_values_p + i] = val
-            body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-            body.append(("store", ("store", tmp_addr, tmp_val)))
+        # Initialize batch counter at the start of each outer iteration
+        self.add("load", ("const", batch_counter, 0))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+        # Record the PC of the inner loop start
+        inner_loop_start = len(self.instrs)
 
-        # Increment round counter, compare, and conditionally jump back
+        # Inner loop body (emitted once, iterated via hardware loop)
+        # idx = mem[inp_indices_p + batch_counter]
+        self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_counter))
+        self.add("load", ("load", tmp_idx, tmp_addr))
+        # val = mem[inp_values_p + batch_counter]
+        self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_counter))
+        self.add("load", ("load", tmp_val, tmp_addr))
+        # node_val = mem[forest_values_p + idx]
+        self.add("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
+        self.add("load", ("load", tmp_node_val, tmp_addr))
+        # val = myhash(val ^ node_val)
+        self.add("alu", ("^", tmp_val, tmp_val, tmp_node_val))
+        hash_slots = self.build_hash(tmp_val, tmp1, tmp2)
+        for engine, slot in hash_slots:
+            self.add(engine, slot)
+        # idx = 2*idx + (1 if val % 2 == 0 else 2)
+        self.add("alu", ("%", tmp1, tmp_val, two_const))
+        self.add("alu", ("==", tmp1, tmp1, zero_const))
+        self.add("flow", ("select", tmp3, tmp1, one_const, two_const))
+        self.add("alu", ("*", tmp_idx, tmp_idx, two_const))
+        self.add("alu", ("+", tmp_idx, tmp_idx, tmp3))
+        # idx = 0 if idx >= n_nodes else idx
+        self.add("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
+        self.add("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))
+        # mem[inp_indices_p + batch_counter] = idx
+        self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], batch_counter))
+        self.add("store", ("store", tmp_addr, tmp_idx))
+        # mem[inp_values_p + batch_counter] = val
+        self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], batch_counter))
+        self.add("store", ("store", tmp_addr, tmp_val))
+
+        # Inner loop control: increment batch_counter, compare, jump back
+        self.add("flow", ("add_imm", batch_counter, batch_counter, 1))
+        self.add("alu", ("<", tmp1, batch_counter, batch_size_addr))
+        self.add("flow", ("cond_jump", tmp1, inner_loop_start))
+
+        # Outer loop control: increment round counter, compare, jump back
         self.add("flow", ("add_imm", round_counter, round_counter, 1))
         self.add("alu", ("<", tmp1, round_counter, rounds_addr))
         self.add("flow", ("cond_jump", tmp1, loop_start))
